@@ -63,7 +63,10 @@ func (az *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.Ob
 	// Open the file from the mount point and get the attributes.
 	fileAttr, err := os.Stat("/mnt/test1/" + options.Name)
 	if err != nil {
-		log.Trace("Encryptor::GetAttr: Error getting file attributes: %s", err.Error())
+		log.Trace("Encryptor::GetAttr : Error getting file attributes: %s", err.Error())
+		if os.IsNotExist(err) {
+			return &internal.ObjAttr{}, nil
+		}
 		return nil, err
 	}
 
@@ -168,7 +171,7 @@ func (e *Encryptor) ReadInBuffer(options internal.ReadInBufferOptions) (length i
 	return
 }
 
-func readAndDecryptBlock(name string, offset int64, len int64, data []byte, encryptedFileSize int64) error {
+func readAndDecryptBlock(name string, offset int64, length int64, data []byte, encryptedFileSize int64) error {
 	var key, _ = base64.StdEncoding.DecodeString("kOwvAznCYUMcrs0qdET0gCIQmMPsl7EDgcbSVWlum6U=")
 	var chunkSize = 1024 * 1024
 	var authTag = 16
@@ -195,19 +198,16 @@ func readAndDecryptBlock(name string, offset int64, len int64, data []byte, encr
 
 	nonceSize := gcm.NonceSize()
 
-	// read data length + 28 byte from the file
-	// decrypt the chunk and write to the output file
-
 	chunkIndex := offset / int64(chunkSize)
 	encryptedChunkOffset := chunkIndex * (int64(chunkSize) + int64(28))
 
 	var encryptedChunk []byte
-	if encryptedChunkOffset+len > encryptedFileSize { // last chunk}
+	if (int64(nonceSize) + int64(chunkSize) + int64(authTag)) > encryptedFileSize { // last chunk}
 		encryptedChunk = make([]byte, encryptedFileSize-encryptedChunkOffset)
 	} else {
 		encryptedChunk = make([]byte, int64(nonceSize)+int64(chunkSize)+int64(authTag))
 	}
-	log.Info("Encryptor:: encryptedFileSize: %d, offset %d , encryptedoffset %d", encryptedFileSize, offset, encryptedChunkOffset)
+	log.Info("Encryptor:: encryptedFileSize: %d, offset %d , encryptedoffset %d, length of encrypted chunk size %d ", encryptedFileSize, offset, encryptedChunkOffset, len(encryptedChunk))
 
 	n, err := encryptedFile.ReadAt(encryptedChunk, encryptedChunkOffset)
 	if err != nil {
