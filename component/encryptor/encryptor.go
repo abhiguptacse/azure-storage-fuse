@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/Azure/azure-storage-fuse/v2/internal"
@@ -56,6 +57,32 @@ func (e *Encryptor) Start(ctx context.Context) error {
 func (az *Encryptor) CommitData(opt internal.CommitDataOptions) error {
 	//Commit is a no op for encryptor.
 	return nil
+}
+
+func (az *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.ObjAttr, err error) {
+	// Open the file from the mount point and get the attributes.
+	fileAttr, err := os.Stat("/mnt/test1/" + options.Name)
+	if err != nil {
+		log.Trace("Encryptor::GetAttr: Error getting file attributes: %s", err.Error())
+		return nil, err
+	}
+
+	// Populate the ObjAttr struct with the file info
+	attr = &internal.ObjAttr{
+		Mtime:  fileAttr.ModTime(),           // Modified time
+		Atime:  time.Now(),                   // Access time (current time as approximation)
+		Ctime:  fileAttr.ModTime(),           // Change time (same as modified time in this case)
+		Crtime: fileAttr.ModTime(),           // Creation time (not available in Go, using modified time)
+		Size:   fileAttr.Size(),              // Size
+		Mode:   fileAttr.Mode(),              // Permissions
+		Path:   "/mnt/test1/" + options.Name, // Full path
+		Name:   fileAttr.Name(),              // Base name of the path
+	}
+	if fileAttr.IsDir() {
+		attr.Flags.Set(internal.PropFlagIsDir)
+	}
+	// Return the populated ObjAttr struct and nil error
+	return attr, nil
 }
 
 func (e *Encryptor) StageData(opt internal.StageDataOptions) error {
