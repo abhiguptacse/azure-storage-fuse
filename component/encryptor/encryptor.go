@@ -6,27 +6,35 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/Azure/azure-storage-fuse/v2/common/config"
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/Azure/azure-storage-fuse/v2/internal"
 )
 
 type Encryptor struct {
 	internal.BaseComponent
+	blockSize        uint64
+	mountPointCipher string
+	encryptionKey    []byte
 }
 
 type EncryptorOptions struct {
-	BlockSize        uint64
-	MountPointCipher string
-	EncryptionKey    string
+	BlockSize          uint64 `config:"block-size-mb" yaml:"block-size-mb,omitempty"`
+	EncryptedMountPath string `config:"encrypted-mount-path" yaml:"encrypted-mount-path,omitempty"`
+	EncryptionKey      string `config:"encryption-key" yaml:"encryption-key,omitempty"`
 }
 
 const (
-	compName = "encryptor"
+	compName    = "encryptor"
+	AuthTagSize = 16
+	NonceSize   = 12
+	MetaSize    = 28
 )
 
 var _ internal.Component = &Encryptor{}
@@ -48,20 +56,57 @@ func (e *Encryptor) Priority() internal.ComponentPriority {
 }
 
 func (e *Encryptor) Configure(isParent bool) error {
+	log.Trace("Encryptor::Configure :  %s", e.Name())
+
+	// Read the configuration
+	conf := EncryptorOptions{}
+	err := config.UnmarshalKey(e.Name(), &conf)
+	if err != nil {
+		log.Err("Encryptor::Configure : config error [invalid config attributes]")
+		return fmt.Errorf("error reading config for %s: %w", e.Name(), err)
+	}
+
+	// fetch encryption key from environment variable
+	key := os.Getenv("ENCRYPTION_KEY")
+	if key == "" {
+		key = conf.EncryptionKey
+	}
+
+	if key == "" {
+		log.Err("Encryptor::Configure : encryption key not set")
+		return fmt.Errorf("encryption key not set")
+	} else {
+		e.encryptionKey, err = base64.StdEncoding.DecodeString(key)
+		if err != nil {
+			log.Err("Encryptor::Configure : error decoding encryption key")
+			return fmt.Errorf("error decoding encryption key: %w", err)
+		}
+	}
+
+	e.blockSize = 1024 * 1024 // default block size is 1MB
+	if config.IsSet(e.Name() + ".block-size-mb") {
+		e.blockSize = conf.BlockSize * 1024 * 1024
+	}
+
+	e.mountPointCipher = "/mnt/cipher/"
+	if config.IsSet(e.Name() + ".encrypted-mount-path") {
+		e.mountPointCipher = conf.EncryptedMountPath
+	}
+
 	return nil
 }
 
 func (e *Encryptor) Start(ctx context.Context) error {
 	return nil
 }
-func (az *Encryptor) CommitData(opt internal.CommitDataOptions) error {
+func (e *Encryptor) CommitData(opt internal.CommitDataOptions) error {
 	//Commit is a no op for encryptor.
 	return nil
 }
 
-func (az *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.ObjAttr, err error) {
+func (e *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.ObjAttr, err error) {
 	// Open the file from the mount point and get the attributes.
-	fileAttr, err := os.Stat("/mnt/test1/" + options.Name)
+	fileAttr, err := os.Stat(e.mountPointCipher + options.Name)
 	if err != nil {
 		log.Trace("Encryptor::GetAttr : Error getting file attributes: %s", err.Error())
 		if os.IsNotExist(err) {
@@ -72,14 +117,14 @@ func (az *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.Ob
 
 	// Populate the ObjAttr struct with the file info
 	attr = &internal.ObjAttr{
-		Mtime:  fileAttr.ModTime(),           // Modified time
-		Atime:  time.Now(),                   // Access time (current time as approximation)
-		Ctime:  fileAttr.ModTime(),           // Change time (same as modified time in this case)
-		Crtime: fileAttr.ModTime(),           // Creation time (not available in Go, using modified time)
-		Size:   fileAttr.Size(),              // Size
-		Mode:   fileAttr.Mode(),              // Permissions
-		Path:   "/mnt/test1/" + options.Name, // Full path
-		Name:   fileAttr.Name(),              // Base name of the path
+		Mtime:  fileAttr.ModTime(),                // Modified time
+		Atime:  time.Now(),                        // Access time (current time as approximation)
+		Ctime:  fileAttr.ModTime(),                // Change time (same as modified time in this case)
+		Crtime: fileAttr.ModTime(),                // Creation time (not available in Go, using modified time)
+		Size:   fileAttr.Size(),                   // Size
+		Mode:   fileAttr.Mode(),                   // Permissions
+		Path:   e.mountPointCipher + options.Name, // Full path
+		Name:   fileAttr.Name(),                   // Base name of the path
 	}
 	if fileAttr.IsDir() {
 		attr.Flags.Set(internal.PropFlagIsDir)
@@ -89,16 +134,12 @@ func (az *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.Ob
 }
 
 func (e *Encryptor) StageData(opt internal.StageDataOptions) error {
-	return encryptWriteBlock(opt.Name, opt.Data, opt.Offset)
+	return e.EncryptWriteBlock(opt.Name, opt.Data, opt.Offset)
 }
 
-func encryptWriteBlock(name string, data []byte, blockId uint64) error {
-	// write the data to the file.
+func (e *Encryptor) EncryptWriteBlock(name string, data []byte, blockId uint64) error {
 
-	var key, _ = base64.StdEncoding.DecodeString("kOwvAznCYUMcrs0qdET0gCIQmMPsl7EDgcbSVWlum6U=")
-	var chunkSize = 1024 * 1024
-
-	encryptedFile, err := os.OpenFile("/mnt/test1/"+name, os.O_RDWR|os.O_CREATE, 0666)
+	encryptedFile, err := os.OpenFile(e.mountPointCipher+name, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		log.Info("Encryptor: Error opening encrypted file: %s", err.Error())
 		return err
@@ -107,7 +148,7 @@ func encryptWriteBlock(name string, data []byte, blockId uint64) error {
 	defer encryptedFile.Close()
 
 	// Create AES cipher block
-	block, err := aes.NewCipher(key)
+	block, err := aes.NewCipher(e.encryptionKey)
 	if err != nil {
 		return err
 	}
@@ -126,22 +167,15 @@ func encryptWriteBlock(name string, data []byte, blockId uint64) error {
 	}
 	encryptedChunk := gcm.Seal(nil, nonce, data, nil)
 
-	encryptedChunkOffset := int64(blockId) * (int64(chunkSize) + int64(28))
-
-	n, err := encryptedFile.WriteAt(nonce, int64(encryptedChunkOffset))
+	encryptedChunkOffset := int64(blockId) * (int64(e.blockSize) + int64(MetaSize))
+	// Write the combined nonce and encrypted chunk
+	n, err := encryptedFile.WriteAt(append(nonce, encryptedChunk...), encryptedChunkOffset)
 	if err != nil {
-		log.Err("Encryptor: Error writing nonce to encrypted file: %s at offset %d : size of data %d", err.Error(), encryptedChunkOffset, n)
+		log.Err("Encryptor: Error writing encrypted chunk to encrypted file: %s at offset %d : size of data %d", err.Error(), encryptedChunkOffset, n)
 		return err
 	}
-	log.Info("Encryptor:: encryptWriteBlock: writing encrypted chunk to encrypted file: %s at offset %d : size of data %d. blockId : %d ", name, encryptedChunkOffset, n, blockId)
-	n, err = encryptedFile.WriteAt(encryptedChunk, int64(encryptedChunkOffset+int64(gcm.NonceSize())))
-	if err != nil {
-		log.Err("Encryptor: Error writing encrypted chunk to encrypted file: %s at offset %d : size of data %d", err.Error(), encryptedChunkOffset+int64(gcm.NonceSize()), n)
-		return err
-	}
-	log.Info("Encryptor:: encryptWriteBlock: writing encrypted chunk to encrypted file: %s at offset %d : size of data %d, blockID %d ", name, encryptedChunkOffset+int64(gcm.NonceSize()), n, blockId)
+	log.Info("Encryptor:: encryptWriteBlock: writing encrypted chunk to encrypted file: %s at offset %d : size of data %d, blockID %d ", name, encryptedChunkOffset, n, blockId)
 
-	// Write the nonce, encrypted chunk, and authentication tag to the output file
 	return nil
 }
 
@@ -161,7 +195,7 @@ func (e *Encryptor) ReadInBuffer(options internal.ReadInBufferOptions) (length i
 		return 0, nil
 	}
 
-	err = readAndDecryptBlock(options.Handle.Path, options.Offset, dataLen, options.Data, options.Handle.Size)
+	err = e.ReadAndDecryptBlock(options.Handle.Path, options.Offset, dataLen, options.Data, options.Handle.Size)
 	if err != nil {
 		log.Err("Encryptor::ReadInBuffer : Failed to read %s [%s] from offset %d", options.Handle.Path, err.Error(), options.Offset)
 		return 0, err
@@ -171,12 +205,9 @@ func (e *Encryptor) ReadInBuffer(options internal.ReadInBufferOptions) (length i
 	return
 }
 
-func readAndDecryptBlock(name string, offset int64, length int64, data []byte, encryptedFileSize int64) error {
-	var key, _ = base64.StdEncoding.DecodeString("kOwvAznCYUMcrs0qdET0gCIQmMPsl7EDgcbSVWlum6U=")
-	var chunkSize = 1024 * 1024
-	var authTag = 16
-
-	encryptedFile, err := os.Open("/mnt/test1/" + name)
+func (e *Encryptor) ReadAndDecryptBlock(name string, offset int64, length int64, data []byte, encryptedFileSize int64) error {
+	log.Trace("Encryptor::ReadAndDecryptBlock : Read %s from %d offset for data size %d encrypted file size %d", name, offset, length, encryptedFileSize)
+	encryptedFile, err := os.Open(e.mountPointCipher + name)
 	if err != nil {
 		log.Info("Encryptor: Error opening encrypted file: %s", err.Error())
 		return err
@@ -185,7 +216,7 @@ func readAndDecryptBlock(name string, offset int64, length int64, data []byte, e
 	defer encryptedFile.Close()
 
 	// Create AES cipher block
-	block, err := aes.NewCipher(key)
+	block, err := aes.NewCipher(e.encryptionKey)
 	if err != nil {
 		return err
 	}
@@ -198,14 +229,16 @@ func readAndDecryptBlock(name string, offset int64, length int64, data []byte, e
 
 	nonceSize := gcm.NonceSize()
 
-	chunkIndex := offset / int64(chunkSize)
-	encryptedChunkOffset := chunkIndex * (int64(chunkSize) + int64(28))
+	chunkIndex := offset / int64(e.blockSize)
+	encryptedChunkOffset := chunkIndex * (int64(e.blockSize) + int64(28))
+
+	nextChunkOffset := (int64(nonceSize) + int64(e.blockSize) + int64(AuthTagSize) + encryptedChunkOffset)
 
 	var encryptedChunk []byte
-	if (int64(nonceSize) + int64(chunkSize) + int64(authTag)) > encryptedFileSize { // last chunk}
+	if nextChunkOffset > encryptedFileSize { // last chunk}
 		encryptedChunk = make([]byte, encryptedFileSize-encryptedChunkOffset)
 	} else {
-		encryptedChunk = make([]byte, int64(nonceSize)+int64(chunkSize)+int64(authTag))
+		encryptedChunk = make([]byte, int64(nonceSize)+int64(e.blockSize)+int64(AuthTagSize))
 	}
 	log.Info("Encryptor:: encryptedFileSize: %d, offset %d , encryptedoffset %d, length of encrypted chunk size %d ", encryptedFileSize, offset, encryptedChunkOffset, len(encryptedChunk))
 
@@ -230,7 +263,7 @@ func readAndDecryptBlock(name string, offset int64, length int64, data []byte, e
 }
 
 func (e *Encryptor) Stop() error {
-	// clear the mount point.
+	// clear the mount point ?.
 	return nil
 }
 
@@ -242,5 +275,4 @@ func NewEncryptorComponent() internal.Component {
 
 func init() {
 	internal.AddComponent(compName, NewEncryptorComponent)
-	// Create a mount point for cipher text from config.
 }
