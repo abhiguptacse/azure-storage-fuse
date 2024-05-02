@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/azure-storage-fuse/v2/common/config"
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/Azure/azure-storage-fuse/v2/internal"
+	"github.com/Azure/azure-storage-fuse/v2/internal/handlemap"
 )
 
 type Encryptor struct {
@@ -104,15 +105,80 @@ func (e *Encryptor) CommitData(opt internal.CommitDataOptions) error {
 	return nil
 }
 
+func (e *Encryptor) CreateFile(options internal.CreateFileOptions) (*handlemap.Handle, error) {
+	// Create the file in the mount point
+	log.Info("Encryptor::createFile : %s", e.mountPointCipher+options.Name)
+	handle := handlemap.NewHandle(options.Name)
+	if handle == nil {
+		log.Trace("Encryptor::createFile : Failed to create handle for file: %s", options.Name)
+		return nil, syscall.EFAULT
+	}
+
+	_, err := os.OpenFile(e.mountPointCipher+options.Name, os.O_RDWR|os.O_CREATE, options.Mode)
+	if err != nil {
+		log.Trace("Encryptor::createFile : Error creating file: %s", err.Error())
+		return nil, err
+	}
+	handle.Mtime = time.Now()
+	// Set the file handle in the handle
+	return handle, nil
+}
+
+func formatListDirName(path string) string {
+	// If we check the root directory, make sure we pass "" instead of "/"
+	// If we aren't checking the root directory, then we want to extend the directory name so List returns all children and does not include the path itself.
+	if path == "/" {
+		path = ""
+	} else if path != "" {
+		path = internal.ExtendDirName(path)
+	}
+	return path
+}
+
+func (e *Encryptor) StreamDir(options internal.StreamDirOptions) ([]*internal.ObjAttr, string, error) {
+	var objAttrs []*internal.ObjAttr
+
+	path := formatListDirName(options.Name)
+	log.Info("Encryptor::StreamDir : %s", path)
+	// Get a list of files in the directory
+	files, err := os.ReadDir(e.mountPointCipher + path)
+	if err != nil {
+		log.Trace("Encryptor::StreamDir : Error reading directory %s : %s", path, err.Error())
+		return nil, "", err
+	}
+
+	// Iterate through files
+	for _, file := range files {
+		// Call GetAttr method for each file
+		attr, err := e.GetAttr(internal.GetAttrOptions{Name: path + file.Name()})
+		if err != nil {
+			if err != syscall.ENOENT {
+				log.Trace("Encryptor::StreamDir : Error getting file attributes: %s", err.Error())
+				return objAttrs, "", err
+			}
+			log.Trace("Encryptor::StreamDir : File not found: %s", file.Name())
+			continue
+		}
+
+		// Append the result to objAttrs
+		objAttrs = append(objAttrs, attr)
+	}
+
+	// Return the objAttrs list and nil error
+	return objAttrs, "", nil
+}
+
 func (e *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.ObjAttr, err error) {
 	// Open the file from the mount point and get the attributes.
+	log.Info("Encryptor::GetAttr for %s", options.Name)
 	fileAttr, err := os.Stat(e.mountPointCipher + options.Name)
 	if err != nil {
-		log.Trace("Encryptor::GetAttr : Error getting file attributes: %s", err.Error())
 		if os.IsNotExist(err) {
-			return &internal.ObjAttr{}, nil
+			log.Trace("Encryptor::GetAttr : File not found: %s", options.Name)
+			return nil, syscall.ENOENT
 		}
-		return nil, err
+		log.Trace("Encryptor::GetAttr : Error getting file attributes: %s", err.Error())
+		return &internal.ObjAttr{}, nil
 	}
 
 	// Populate the ObjAttr struct with the file info
@@ -235,7 +301,7 @@ func (e *Encryptor) ReadAndDecryptBlock(name string, offset int64, length int64,
 	nextChunkOffset := (int64(nonceSize) + int64(e.blockSize) + int64(AuthTagSize) + encryptedChunkOffset)
 
 	var encryptedChunk []byte
-	if nextChunkOffset > encryptedFileSize { // last chunk}
+	if nextChunkOffset > encryptedFileSize { // last chunk
 		encryptedChunk = make([]byte, encryptedFileSize-encryptedChunkOffset)
 	} else {
 		encryptedChunk = make([]byte, int64(nonceSize)+int64(e.blockSize)+int64(AuthTagSize))
@@ -262,8 +328,14 @@ func (e *Encryptor) ReadAndDecryptBlock(name string, offset int64, length int64,
 	return nil
 }
 
-func (e *Encryptor) Stop() error {
-	// clear the mount point ?.
+func (e *Encryptor) CreateDir(options internal.CreateDirOptions) error {
+	// Create the directory in the mount point
+	log.Info("Encryptor::CreateDir : %s", e.mountPointCipher+options.Name)
+	err := os.Mkdir(e.mountPointCipher+options.Name, 0777)
+	if err != nil {
+		log.Trace("Encryptor::CreateDir : Error creating directory: %s", err.Error())
+		return err
+	}
 	return nil
 }
 
