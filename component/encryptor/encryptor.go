@@ -2,9 +2,6 @@ package encryptor
 
 import (
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"encoding/base64"
 	"fmt"
 	"os"
@@ -200,6 +197,7 @@ func (e *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.Obj
 }
 
 func (e *Encryptor) StageData(opt internal.StageDataOptions) error {
+	log.Info("Encryptor::StageData : %s, offset %d, data %d", opt.Name, opt.Offset, len(opt.Data))
 	return e.EncryptWriteBlock(opt.Name, opt.Data, opt.Offset)
 }
 
@@ -213,25 +211,11 @@ func (e *Encryptor) EncryptWriteBlock(name string, data []byte, blockId uint64) 
 
 	defer encryptedFile.Close()
 
-	// Create AES cipher block
-	block, err := aes.NewCipher(e.encryptionKey)
+	encryptedChunk, nonce, err := EncryptChunk(data, e.encryptionKey)
 	if err != nil {
+		log.Err("Encryptor: Error encrypting data: %s", err.Error())
 		return err
 	}
-
-	// Create AES-GCM cipher
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
-
-	// Generate a random nonce
-	nonce := make([]byte, gcm.NonceSize())
-	// Generate a random nonce for each chunk
-	if _, err := rand.Read(nonce); err != nil {
-		return err
-	}
-	encryptedChunk := gcm.Seal(nil, nonce, data, nil)
 
 	encryptedChunkOffset := int64(blockId) * (int64(e.blockSize) + int64(MetaSize))
 	// Write the combined nonce and encrypted chunk
@@ -281,30 +265,16 @@ func (e *Encryptor) ReadAndDecryptBlock(name string, offset int64, length int64,
 
 	defer encryptedFile.Close()
 
-	// Create AES cipher block
-	block, err := aes.NewCipher(e.encryptionKey)
-	if err != nil {
-		return err
-	}
-
-	// Create AES-GCM cipher
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
-
-	nonceSize := gcm.NonceSize()
-
 	chunkIndex := offset / int64(e.blockSize)
 	encryptedChunkOffset := chunkIndex * (int64(e.blockSize) + int64(28))
 
-	nextChunkOffset := (int64(nonceSize) + int64(e.blockSize) + int64(AuthTagSize) + encryptedChunkOffset)
+	nextChunkOffset := (int64(NonceSize) + int64(e.blockSize) + int64(AuthTagSize) + encryptedChunkOffset)
 
 	var encryptedChunk []byte
 	if nextChunkOffset > encryptedFileSize { // last chunk
 		encryptedChunk = make([]byte, encryptedFileSize-encryptedChunkOffset)
 	} else {
-		encryptedChunk = make([]byte, int64(nonceSize)+int64(e.blockSize)+int64(AuthTagSize))
+		encryptedChunk = make([]byte, int64(NonceSize)+int64(e.blockSize)+int64(AuthTagSize))
 	}
 	log.Info("Encryptor:: encryptedFileSize: %d, offset %d , encryptedoffset %d, length of encrypted chunk size %d ", encryptedFileSize, offset, encryptedChunkOffset, len(encryptedChunk))
 
@@ -316,15 +286,14 @@ func (e *Encryptor) ReadAndDecryptBlock(name string, offset int64, length int64,
 
 	log.Info("Encryptor: Read %d bytes from encrypted file", n)
 
-	// Decrypt the chunk with AES-GCM
-	decryptedChunk, err := gcm.Open(nil, encryptedChunk[:nonceSize], encryptedChunk[nonceSize:], nil)
+	plainText, err := DecryptChunk(encryptedChunk[NonceSize:], encryptedChunk[:NonceSize], e.encryptionKey)
 	if err != nil {
 		log.Err("Encryptor: Error decrypting file: %s", err.Error())
 		return err
 	}
 
 	// Write the decrypted chunk to the data buffer
-	copy(data, decryptedChunk)
+	copy(data, plainText)
 	return nil
 }
 
