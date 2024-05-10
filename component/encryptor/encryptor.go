@@ -18,9 +18,11 @@ import (
 
 type Encryptor struct {
 	internal.BaseComponent
+	handle           *handlemap.Handle
 	blockSize        uint64
 	mountPointCipher string
 	encryptionKey    []byte
+	endBlockIndex    int64 // keep track of the farthest block that has been written to the file
 }
 
 type EncryptorOptions struct {
@@ -92,6 +94,9 @@ func (e *Encryptor) Configure(isParent bool) error {
 		e.mountPointCipher = conf.EncryptedMountPath
 	}
 
+	// no block is written to the file yet
+	e.endBlockIndex = -1
+
 	return nil
 }
 
@@ -106,8 +111,8 @@ func (e *Encryptor) CommitData(opt internal.CommitDataOptions) error {
 func (e *Encryptor) CreateFile(options internal.CreateFileOptions) (*handlemap.Handle, error) {
 	// Create the file in the mount point
 	log.Info("Encryptor::createFile : %s", e.mountPointCipher+options.Name)
-	handle := handlemap.NewHandle(options.Name)
-	if handle == nil {
+	e.handle = handlemap.NewHandle(options.Name)
+	if e.handle == nil {
 		log.Trace("Encryptor::createFile : Failed to create handle for file: %s", options.Name)
 		return nil, syscall.EFAULT
 	}
@@ -117,10 +122,10 @@ func (e *Encryptor) CreateFile(options internal.CreateFileOptions) (*handlemap.H
 		log.Trace("Encryptor::createFile : Error creating file: %s", err.Error())
 		return nil, err
 	}
-	handle.FObj = fileHandle
-	handle.Mtime = time.Now()
+	e.handle.FObj = fileHandle
+	e.handle.Mtime = time.Now()
 	// Set the file handle in the handle
-	return handle, nil
+	return e.handle, nil
 }
 
 func formatListDirName(path string) string {
@@ -212,6 +217,7 @@ func (e *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.Obj
 		log.Trace("Encryptor::GetAttr : Error opening file: %s", err.Error())
 		return nil, err
 	}
+	defer fileHandle.Close()
 
 	if fileAttr.IsDir() {
 		attr.Size = fileAttr.Size()
@@ -225,8 +231,6 @@ func (e *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.Obj
 		log.Info("Encryptor::GetAttr : actual file size %d", actualFileSize)
 		attr.Size = actualFileSize
 	}
-
-	// Return the populated ObjAttr struct and nil error
 	return attr, nil
 }
 
@@ -237,11 +241,8 @@ func (e *Encryptor) StageData(opt internal.StageDataOptions) error {
 
 func (e *Encryptor) EncryptWriteBlock(name string, data []byte, blockId uint64) error {
 
-	encryptedFile, err := os.OpenFile(e.mountPointCipher+name, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		log.Info("Encryptor: Error opening encrypted file: %s", err.Error())
-		return err
-	}
+	e.handle.Lock()
+	encryptedFile := e.handle.FObj
 
 	paddingLength := 0
 	if len(data) < int(e.blockSize) {
@@ -259,7 +260,7 @@ func (e *Encryptor) EncryptWriteBlock(name string, data []byte, blockId uint64) 
 
 	encryptedChunkOffset := int64(blockId) * (int64(e.blockSize) + int64(MetaSize))
 	// Write the combined nonce and encrypted chunk
-	if paddingLength > 0 {
+	if paddingLength > 0 || int64(blockId) > e.endBlockIndex {
 		paddingLengthByte := make([]byte, 8)
 		binary.BigEndian.PutUint64(paddingLengthByte, uint64(paddingLength))
 		n, err := encryptedFile.WriteAt(append(append(nonce, encryptedChunk...), paddingLengthByte...), encryptedChunkOffset)
@@ -274,6 +275,10 @@ func (e *Encryptor) EncryptWriteBlock(name string, data []byte, blockId uint64) 
 			return err
 		}
 	}
+	if int64(blockId) > e.endBlockIndex {
+		e.endBlockIndex = int64(blockId)
+	}
+	e.handle.Unlock()
 	log.Info("Encryptor:: encryptWriteBlock: writing encrypted chunk to encrypted file: %s at offset %d ,blockID %d ", name, encryptedChunkOffset, blockId)
 
 	return nil
@@ -313,6 +318,7 @@ func (e *Encryptor) ReadAndDecryptBlock(name string, offset int64, length int64,
 		log.Err("Encryptor::ReadAndDecryptBlock : Error opening encrypted file: %s", err.Error())
 		return err
 	}
+	defer fileHandle.Close()
 	chunkIndex := offset / int64(e.blockSize)
 	encryptedChunkOffset := chunkIndex * (int64(e.blockSize) + MetaSize)
 	encryptedChunk := make([]byte, e.blockSize+MetaSize)
