@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -22,7 +23,17 @@ type Encryptor struct {
 	blockSize        uint64
 	mountPointCipher string
 	encryptionKey    []byte
-	endBlockIndex    int64 // keep track of the farthest block that has been written to the file
+}
+
+type LastChunkMeta struct {
+	sync.Mutex
+	endBlockIndex int64 // keep track of the farthest block that has been written to the file
+	paddingLength int64 // keep track of the padding length of the last block
+}
+
+var lastchunkMeta = &LastChunkMeta{
+	endBlockIndex: -1,
+	paddingLength: 0,
 }
 
 type EncryptorOptions struct {
@@ -94,9 +105,6 @@ func (e *Encryptor) Configure(isParent bool) error {
 		e.mountPointCipher = conf.EncryptedMountPath
 	}
 
-	// no block is written to the file yet
-	e.endBlockIndex = -1
-
 	return nil
 }
 
@@ -104,7 +112,25 @@ func (e *Encryptor) Start(ctx context.Context) error {
 	return nil
 }
 func (e *Encryptor) CommitData(opt internal.CommitDataOptions) error {
-	//Commit is a no op for encryptor.
+	fileHandle := e.handle.FObj
+	defer fileHandle.Close()
+	lastchunkMeta.Lock()
+	defer lastchunkMeta.Unlock()
+
+	if lastchunkMeta.endBlockIndex != -1 {
+		// Write the padding length to the end of the file
+		paddingLengthByte := make([]byte, 8)
+		binary.BigEndian.PutUint64(paddingLengthByte, uint64(lastchunkMeta.paddingLength))
+		endoffset := (lastchunkMeta.endBlockIndex + 1) * (int64(e.blockSize) + MetaSize)
+		n, err := fileHandle.WriteAt(paddingLengthByte, endoffset)
+		log.Info("Encryptor::CommitData : writing %d bytes, padding length %d to file at offset %d", n, lastchunkMeta.paddingLength, endoffset)
+		if err != nil {
+			log.Err("Encryptor: Error writing padding length to file: %s", err.Error())
+			return err
+		}
+		lastchunkMeta.endBlockIndex = -1
+		lastchunkMeta.paddingLength = 0
+	}
 	return nil
 }
 
@@ -122,6 +148,8 @@ func (e *Encryptor) CreateFile(options internal.CreateFileOptions) (*handlemap.H
 		log.Trace("Encryptor::createFile : Error creating file: %s", err.Error())
 		return nil, err
 	}
+
+	// Take a map of file handles for parallel read/write to different files ?
 	e.handle.FObj = fileHandle
 	e.handle.Mtime = time.Now()
 	// Set the file handle in the handle
@@ -171,6 +199,7 @@ func (e *Encryptor) StreamDir(options internal.StreamDirOptions) ([]*internal.Ob
 	// Return the objAttrs list and nil error
 	return objAttrs, "", nil
 }
+
 func checkForActualFileSize(fileHandle *os.File, currentFileSize int64, blockSize int64) (int64, error) {
 	// check if file is multiple of block size
 	if currentFileSize%(blockSize+MetaSize) == 0 {
@@ -241,17 +270,14 @@ func (e *Encryptor) StageData(opt internal.StageDataOptions) error {
 
 func (e *Encryptor) EncryptWriteBlock(name string, data []byte, blockId uint64) error {
 
-	e.handle.Lock()
 	encryptedFile := e.handle.FObj
-
-	paddingLength := 0
+	paddingLength := int64(0)
 	if len(data) < int(e.blockSize) {
 		// Pad the data to the block size
-		paddingLength = int(e.blockSize) - len(data)
+		paddingLength = int64(e.blockSize) - int64(len(data))
 		data = append(data, make([]byte, paddingLength)...)
 	}
-
-	log.Info("Encryptor:: encryptWriteBlock: writing encrypted chunk to encrypted file: %s at offset %d : with padding length %d, blockID %d ", name, blockId*(e.blockSize+MetaSize), paddingLength, blockId)
+	log.Info("Encryptor:: encryptWriteBlock: writing encrypted chunk to encrypted file: %s at offset %d, blockID %d ", name, blockId*(e.blockSize+MetaSize), blockId)
 	encryptedChunk, nonce, err := EncryptChunk(data, e.encryptionKey)
 	if err != nil {
 		log.Err("Encryptor: Error encrypting data: %s", err.Error())
@@ -260,27 +286,20 @@ func (e *Encryptor) EncryptWriteBlock(name string, data []byte, blockId uint64) 
 
 	encryptedChunkOffset := int64(blockId) * (int64(e.blockSize) + int64(MetaSize))
 	// Write the combined nonce and encrypted chunk
-	if paddingLength > 0 || int64(blockId) > e.endBlockIndex {
-		paddingLengthByte := make([]byte, 8)
-		binary.BigEndian.PutUint64(paddingLengthByte, uint64(paddingLength))
-		n, err := encryptedFile.WriteAt(append(append(nonce, encryptedChunk...), paddingLengthByte...), encryptedChunkOffset)
-		if err != nil {
-			log.Err("Encryptor: Error writing encrypted chunk to encrypted file: %s at offset %d : size of data %d", err.Error(), encryptedChunkOffset, n)
-			return err
-		}
-	} else {
-		n, err := encryptedFile.WriteAt(append(nonce, encryptedChunk...), encryptedChunkOffset)
-		if err != nil {
-			log.Err("Encryptor: Error writing encrypted chunk to encrypted file: %s at offset %d : size of data %d", err.Error(), encryptedChunkOffset, n)
-			return err
-		}
+	n, err := encryptedFile.WriteAt(append(nonce, encryptedChunk...), encryptedChunkOffset)
+	log.Info("Encryptor:: encryptWriteBlock: writing %d bytes to encrypted file: %s at offset %d", n, name, encryptedChunkOffset)
+	if err != nil {
+		log.Err("Encryptor: Error writing encrypted chunk to encrypted file: %s at offset %d : size of data %d", err.Error(), encryptedChunkOffset, n)
+		return err
 	}
-	if int64(blockId) > e.endBlockIndex {
-		e.endBlockIndex = int64(blockId)
-	}
-	e.handle.Unlock()
-	log.Info("Encryptor:: encryptWriteBlock: writing encrypted chunk to encrypted file: %s at offset %d ,blockID %d ", name, encryptedChunkOffset, blockId)
 
+	lastchunkMeta.Lock()
+	defer lastchunkMeta.Unlock()
+	if int64(blockId) > lastchunkMeta.endBlockIndex {
+		lastchunkMeta.endBlockIndex = int64(blockId)
+	}
+	lastchunkMeta.paddingLength = paddingLength
+	log.Info("Encryptor:: encryptWriteBlock: endBlockIndex %d, paddingLength %d", lastchunkMeta.endBlockIndex, lastchunkMeta.paddingLength)
 	return nil
 }
 
