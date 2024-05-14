@@ -439,8 +439,7 @@ func (e *Encryptor_v2) ReadAndDecryptBlock(name string, offset int64, length int
 		return err
 	}
 	log.Info("Encryptor::ReadAndDecryptBlock : Read %d bytes from meta file", n)
-
-	plainText, err := DecryptChunk(append(encryptedChunk, metaBlock[:NonceSize]...), metaBlock[NonceSize:], e.encryptionKey)
+	plainText, err := DecryptChunk(append(encryptedChunk, metaBlock[NonceSize:]...), metaBlock[:NonceSize], e.encryptionKey)
 	if err != nil {
 		log.Err("Encryptor: Error decrypting file: %s", err.Error())
 		return err
