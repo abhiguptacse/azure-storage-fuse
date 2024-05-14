@@ -1006,7 +1006,7 @@ func (bc *BlockCache) getOrCreateBlock(handle *handlemap.Handle, offset uint64) 
 
 // Stage the given number of blocks from this handle
 func (bc *BlockCache) stageBlocks(handle *handlemap.Handle, cnt int) error {
-	//log.Debug("BlockCache::stageBlocks : Stageing blocks for %s, cnt %v", handle.Path, cnt)
+	//log.Debug("BlockCache::stageBlocks : Staging blocks for %s, cnt %v", handle.Path, cnt)
 
 	nodeList := handle.Buffers.Cooking
 	node := nodeList.Front()
@@ -1172,7 +1172,7 @@ return_safe:
 
 // Stage the given number of blocks from this handle
 func (bc *BlockCache) commitBlocks(handle *handlemap.Handle) error {
-	log.Debug("BlockCache::commitBlocks : Stageing blocks for %s", handle.Path)
+	log.Debug("BlockCache::commitBlocks : Staging blocks for %s", handle.Path)
 
 	// Make three attempts to upload all pending blocks
 	cnt := 0
@@ -1237,6 +1237,12 @@ func (bc *BlockCache) commitBlocks(handle *handlemap.Handle) error {
 // diskEvict : Callback when a node from disk expires
 func (bc *BlockCache) diskEvict(node *list.Element) {
 	fileName := node.Value.(string)
+
+	// If this block is already locked then return otherwise Lock() will hung up
+	if bc.fileLocks.Locked(fileName) {
+		log.Info("BlockCache::diskEvict : File %s is locked so skipping eviction", fileName)
+		return
+	}
 
 	// Lock the file name so that its not downloaded when deletion is going on
 	flock := bc.fileLocks.Get(fileName)
