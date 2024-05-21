@@ -33,6 +33,8 @@ func EncryptChunk(data []byte, key []byte) (cipherText []byte, nonce []byte, err
 	return cipherText, nonce, nil
 }
 
+// DecryptChunk decrypts a chunk of data using the provided nonce
+// and key and returns the plain text data.
 func DecryptChunk(cipherText []byte, nonce []byte, key []byte) (plainText []byte, err error) {
 	// Create AES cipher block
 	block, err := aes.NewCipher(key)
