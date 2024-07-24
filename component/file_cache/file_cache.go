@@ -155,7 +155,7 @@ func (c *FileCache) Start(ctx context.Context) error {
 	log.Trace("Starting component : %s", c.Name())
 
 	if c.cleanupOnStart {
-		err := c.TempCacheCleanup()
+		err := common.TempCacheCleanup(c.tmpPath)
 		if err != nil {
 			return fmt.Errorf("error in %s error [fail to cleanup temp cache]", c.Name())
 		}
@@ -187,27 +187,9 @@ func (c *FileCache) Stop() error {
 	}
 
 	_ = c.policy.ShutdownPolicy()
-	_ = c.TempCacheCleanup()
+	_ = common.TempCacheCleanup(c.tmpPath)
 
 	fileCacheStatsCollector.Destroy()
-
-	return nil
-}
-
-func (c *FileCache) TempCacheCleanup() error {
-	// TODO : Cleanup temp cache dir before exit
-	if !isLocalDirEmpty(c.tmpPath) {
-		log.Err("FileCache::TempCacheCleanup : Cleaning up temp directory %s", c.tmpPath)
-
-		dirents, err := os.ReadDir(c.tmpPath)
-		if err != nil {
-			return nil
-		}
-
-		for _, entry := range dirents {
-			os.RemoveAll(filepath.Join(c.tmpPath, entry.Name()))
-		}
-	}
 
 	return nil
 }
@@ -241,7 +223,6 @@ func (c *FileCache) Configure(_ bool) error {
 	c.cleanupOnStart = conf.CleanupOnStart
 	c.policyTrace = conf.EnablePolicyTrace
 	c.offloadIO = conf.OffloadIO
-	c.maxCacheSize = conf.MaxSizeMB
 	c.syncToFlush = conf.SyncToFlush
 	c.syncToDelete = !conf.SyncNoOp
 	c.refreshSec = conf.RefreshSec
@@ -276,6 +257,19 @@ func (c *FileCache) Configure(_ bool) error {
 		}
 	}
 
+	var stat syscall.Statfs_t
+	err = syscall.Statfs(c.tmpPath, &stat)
+	if err != nil {
+		log.Err("FileCache::Configure : config error %s [%s]. Assigning a default value of 4GB or if any value is assigned to .disk-size-mb in config.", c.Name(), err.Error())
+		c.maxCacheSize = 4192 * MB
+	} else {
+		c.maxCacheSize = 0.8 * float64(stat.Bavail) * float64(stat.Bsize)
+	}
+
+	if config.IsSet(compName+".max-size-mb") && conf.MaxSizeMB != 0 {
+		c.maxCacheSize = conf.MaxSizeMB
+	}
+
 	if !isLocalDirEmpty(c.tmpPath) && !c.allowNonEmpty {
 		log.Err("FileCache: config error %s directory is not empty", c.tmpPath)
 		return fmt.Errorf("config error in %s [%s]", c.Name(), "temp directory not empty")
@@ -294,16 +288,7 @@ func (c *FileCache) Configure(_ bool) error {
 	}
 
 	cacheConfig := c.GetPolicyConfig(conf)
-
-	switch strings.ToLower(conf.Policy) {
-	case "lru":
-		c.policy = NewLRUPolicy(cacheConfig)
-	case "lfu":
-		c.policy = NewLFUPolicy(cacheConfig)
-	default:
-		log.Info("FileCache::Configure : Using default eviction policy")
-		c.policy = NewLRUPolicy(cacheConfig)
-	}
+	c.policy = NewLRUPolicy(cacheConfig)
 
 	if c.policy == nil {
 		log.Err("FileCache::Configure : failed to create cache eviction policy")

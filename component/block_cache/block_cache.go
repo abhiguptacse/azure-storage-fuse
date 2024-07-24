@@ -39,11 +39,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Azure/azure-storage-fuse/v2/common"
@@ -161,28 +164,7 @@ func (bc *BlockCache) Stop() error {
 	// Clear the disk cache on exit
 	if bc.tmpPath != "" {
 		_ = bc.diskPolicy.Stop()
-		_ = bc.TempCacheCleanup()
-	}
-
-	return nil
-}
-
-// TempCacheCleanup cleans up the local cached contents
-func (bc *BlockCache) TempCacheCleanup() error {
-	if bc.tmpPath == "" {
-		return nil
-	}
-
-	log.Info("BlockCache::TempCacheCleanup : Cleaning up temp directory %s", bc.tmpPath)
-
-	dirents, err := os.ReadDir(bc.tmpPath)
-	if err != nil {
-		log.Err("BlockCache::TempCacheCleanup : Failed to list directory %s [%v]", bc.tmpPath, err.Error())
-		return fmt.Errorf("failed to list directory %s", bc.tmpPath)
-	}
-
-	for _, entry := range dirents {
-		os.RemoveAll(filepath.Join(bc.tmpPath, entry.Name()))
+		_ = common.TempCacheCleanup(bc.tmpPath)
 	}
 
 	return nil
@@ -194,6 +176,7 @@ func (bc *BlockCache) TempCacheCleanup() error {
 func (bc *BlockCache) Configure(_ bool) error {
 	log.Trace("BlockCache::Configure : %s", bc.Name())
 
+	defaultMemSize := false
 	conf := BlockCacheOptions{}
 	err := config.UnmarshalKey(bc.Name(), &conf)
 	if err != nil {
@@ -206,23 +189,32 @@ func (bc *BlockCache) Configure(_ bool) error {
 		bc.blockSize = uint64(conf.BlockSize * float64(_1MB))
 	}
 
-	bc.memSize = uint64(4192) * _1MB
 	if config.IsSet(compName + ".mem-size-mb") {
 		bc.memSize = conf.MemSize * _1MB
+	} else {
+		var sysinfo syscall.Sysinfo_t
+		err = syscall.Sysinfo(&sysinfo)
+		if err != nil {
+			log.Err("BlockCache::Configure : config error %s [%s]. Assigning a pre-defined value of 4GB.", bc.Name(), err.Error())
+			bc.memSize = uint64(4192) * _1MB
+		} else {
+			bc.memSize = uint64(0.8 * (float64)(sysinfo.Freeram) * float64(sysinfo.Unit))
+			defaultMemSize = true
+		}
 	}
 
-	bc.diskSize = uint64(4192)
-	if config.IsSet(compName + ".disk-size-mb") {
-		bc.diskSize = conf.DiskSize
-	}
 	bc.diskTimeout = defaultTimeout
 	if config.IsSet(compName + ".disk-timeout-sec") {
 		bc.diskTimeout = conf.DiskTimeout
 	}
 
 	bc.prefetchOnOpen = conf.PrefetchOnOpen
-	bc.prefetch = MIN_PREFETCH
+	bc.prefetch = uint32(math.Max((MIN_PREFETCH*2)+1, (float64)(2*runtime.NumCPU())))
 	bc.noPrefetch = false
+
+	if defaultMemSize && (uint64(bc.prefetch)*uint64(bc.blockSize)) > bc.memSize {
+		bc.prefetch = (MIN_PREFETCH * 2) + 1
+	}
 
 	err = config.UnmarshalKey("lazy-write", &bc.lazyWrite)
 	if err != nil {
@@ -242,7 +234,7 @@ func (bc *BlockCache) Configure(_ bool) error {
 
 	bc.maxDiskUsageHit = false
 
-	bc.workers = 128
+	bc.workers = uint32(3 * runtime.NumCPU())
 	if config.IsSet(compName + ".parallelism") {
 		bc.workers = conf.Workers
 	}
@@ -261,6 +253,18 @@ func (bc *BlockCache) Configure(_ bool) error {
 				return fmt.Errorf("config error in %s [%s]", bc.Name(), err.Error())
 			}
 		}
+		var stat syscall.Statfs_t
+		err = syscall.Statfs(bc.tmpPath, &stat)
+		if err != nil {
+			log.Err("BlockCache::Configure : config error %s [%s]. Assigning a default value of 4GB or if any value is assigned to .disk-size-mb in config.", bc.Name(), err.Error())
+			bc.diskSize = uint64(4192) * _1MB
+		} else {
+			bc.diskSize = uint64(0.8 * float64(stat.Bavail) * float64(stat.Bsize))
+		}
+	}
+
+	if config.IsSet(compName + ".disk-size-mb") {
+		bc.diskSize = conf.DiskSize * _1MB
 	}
 
 	if (uint64(bc.prefetch) * uint64(bc.blockSize)) > bc.memSize {
@@ -268,7 +272,7 @@ func (bc *BlockCache) Configure(_ bool) error {
 		return fmt.Errorf("config error in %s [memory limit too low for configured prefetch]", bc.Name())
 	}
 
-	log.Info("BlockCache::Configure : block size %v, mem size %v, worker %v, prefetch %v, disk path %v, max size %vMB, disk timeout %v, prefetch-on-open %t, maxDiskUsageHit %v, noPrefetch %v",
+	log.Info("BlockCache::Configure : block size %v, mem size %v, worker %v, prefetch %v, disk path %v, max size %v, disk timeout %v, prefetch-on-open %t, maxDiskUsageHit %v, noPrefetch %v",
 		bc.blockSize, bc.memSize, bc.workers, bc.prefetch, bc.tmpPath, bc.diskSize, bc.diskTimeout, bc.prefetchOnOpen, bc.maxDiskUsageHit, bc.noPrefetch)
 
 	bc.blockPool = NewBlockPool(bc.blockSize, bc.memSize)
@@ -284,7 +288,7 @@ func (bc *BlockCache) Configure(_ bool) error {
 	}
 
 	if bc.tmpPath != "" {
-		bc.diskPolicy, err = tlru.New(uint32((bc.diskSize*_1MB)/bc.blockSize), bc.diskTimeout, bc.diskEvict, 60, bc.checkDiskUsage)
+		bc.diskPolicy, err = tlru.New(uint32((bc.diskSize)/bc.blockSize), bc.diskTimeout, bc.diskEvict, 60, bc.checkDiskUsage)
 		if err != nil {
 			log.Err("BlockCache::Configure : fail to create LRU for memory nodes [%s]", err.Error())
 			return fmt.Errorf("config error in %s [%s]", bc.Name(), err.Error())
@@ -333,6 +337,7 @@ func (bc *BlockCache) OpenFile(options internal.OpenFileOptions) (*handlemap.Han
 
 	if options.Flags&os.O_TRUNC != 0 || options.Flags&os.O_WRONLY != 0 {
 		// If file is opened in truncate or wronly mode then we need to wipe out the data consider current file size as 0
+		log.Debug("BlockCache::OpenFile : Truncate %v to 0", options.Name)
 		handle.Size = 0
 		handle.Flags.Set(handlemap.HandleFlagDirty)
 	} else if options.Flags&os.O_RDWR != 0 && handle.Size != 0 {
@@ -404,10 +409,13 @@ func (bc *BlockCache) FlushFile(options internal.FlushFileOptions) error {
 	options.Handle.Lock()
 	defer options.Handle.Unlock()
 
-	err := bc.commitBlocks(options.Handle)
-	if err != nil {
-		log.Err("BlockCache::FlushFile : Failed to commit blocks for %s [%s]", options.Handle.Path, err.Error())
-		return err
+	// call commit blocks only if the handle is dirty
+	if options.Handle.Dirty() {
+		err := bc.commitBlocks(options.Handle)
+		if err != nil {
+			log.Err("BlockCache::FlushFile : Failed to commit blocks for %s [%s]", options.Handle.Path, err.Error())
+			return err
+		}
 	}
 
 	return nil
@@ -893,7 +901,7 @@ func (bc *BlockCache) download(item *workItem) {
 
 // WriteFile: Write to the local file
 func (bc *BlockCache) WriteFile(options internal.WriteFileOptions) (int, error) {
-	//log.Debug("BlockCache::WriteFile : Writing %v bytes from %s", len(options.Data), options.Handle.Path)
+	// log.Debug("BlockCache::WriteFile : Writing %v bytes from %s", len(options.Data), options.Handle.Path)
 
 	options.Handle.Lock()
 	defer options.Handle.Unlock()
@@ -934,7 +942,7 @@ func (bc *BlockCache) getOrCreateBlock(handle *handlemap.Handle, offset uint64) 
 	index := bc.getBlockIndex(offset)
 	if index >= MAX_BLOCKS {
 		log.Err("BlockCache::getOrCreateBlock : Failed to get Block %v=>%s offset %v", handle.ID, handle.Path, offset)
-		return nil, fmt.Errorf("block index out of range. Increase your block size.")
+		return nil, fmt.Errorf("block index out of range. Increase your block size")
 	}
 
 	//log.Debug("FilBlockCacheCache::getOrCreateBlock : Get block for %s, index %v", handle.Path, index)
@@ -1258,7 +1266,7 @@ func (bc *BlockCache) diskEvict(node *list.Element) {
 // checkDiskUsage : Callback to check usage of disk and decide whether eviction is needed
 func (bc *BlockCache) checkDiskUsage() bool {
 	data, _ := common.GetUsage(bc.tmpPath)
-	usage := uint32((data * 100) / float64(bc.diskSize))
+	usage := uint32((data * 100) / float64(bc.diskSize/_1MB))
 
 	if bc.maxDiskUsageHit {
 		if usage >= MIN_POOL_USAGE {

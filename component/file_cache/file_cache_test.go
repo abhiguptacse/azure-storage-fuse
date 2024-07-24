@@ -34,11 +34,15 @@
 package file_cache
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -161,7 +165,7 @@ func (suite *fileCacheTestSuite) TestEmpty() {
 func (suite *fileCacheTestSuite) TestConfig() {
 	defer suite.cleanupTest()
 	suite.cleanupTest() // teardown the default file cache generated
-	policy := "lfu"
+	policy := "lru"
 	maxSizeMb := 1024
 	cacheTimeout := 60
 	maxDeletion := 10
@@ -178,10 +182,10 @@ func (suite *fileCacheTestSuite) TestConfig() {
 	suite.assert.Equal(suite.fileCache.tmpPath, suite.cache_path)
 	suite.assert.Equal(suite.fileCache.policy.Name(), policy)
 
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).maxSizeMB, maxSizeMb)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).maxEviction, maxDeletion)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).highThreshold, highThreshold)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).lowThreshold, lowThreshold)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).maxSizeMB, maxSizeMb)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).maxEviction, maxDeletion)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).highThreshold, highThreshold)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).lowThreshold, lowThreshold)
 
 	suite.assert.Equal(suite.fileCache.createEmptyFile, createEmptyFile)
 	suite.assert.Equal(suite.fileCache.allowNonEmpty, allowNonEmptyTemp)
@@ -189,10 +193,30 @@ func (suite *fileCacheTestSuite) TestConfig() {
 	suite.assert.Equal(suite.fileCache.cleanupOnStart, cleanupOnStart)
 }
 
+func (suite *fileCacheTestSuite) TestDefaultCacheSize() {
+	defer suite.cleanupTest()
+	// Setup
+	config := fmt.Sprintf("file_cache:\n  path: %s\n", suite.cache_path)
+	suite.setupTestHelper(config) // setup a new file cache with a custom config (teardown will occur after the test as usual)
+
+	cmd := exec.Command("bash", "-c", fmt.Sprintf("df -B1 %s | awk 'NR==2{print $4}'", suite.cache_path))
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	suite.assert.Nil(err)
+	freeDisk, err := strconv.Atoi(strings.TrimSpace(out.String()))
+	suite.assert.Nil(err)
+	expected := uint64(0.8 * float64(freeDisk))
+	actual := suite.fileCache.maxCacheSize
+	difference := math.Abs(float64(actual) - float64(expected))
+	tolerance := 0.10 * float64(math.Max(float64(actual), float64(expected)))
+	suite.assert.LessOrEqual(difference, tolerance, "mssg:", actual, expected)
+}
+
 func (suite *fileCacheTestSuite) TestConfigPolicyTimeout() {
 	defer suite.cleanupTest()
 	suite.cleanupTest() // teardown the default file cache generated
-	policy := "lfu"
+	policy := "lru"
 	maxSizeMb := 1024
 	cacheTimeout := 60
 	maxDeletion := 10
@@ -209,11 +233,11 @@ func (suite *fileCacheTestSuite) TestConfigPolicyTimeout() {
 	suite.assert.Equal(suite.fileCache.tmpPath, suite.cache_path)
 	suite.assert.Equal(suite.fileCache.policy.Name(), policy)
 
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).maxSizeMB, maxSizeMb)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).maxEviction, maxDeletion)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).highThreshold, highThreshold)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).lowThreshold, lowThreshold)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).cacheTimeout, cacheTimeout)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).maxSizeMB, maxSizeMb)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).maxEviction, maxDeletion)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).highThreshold, highThreshold)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).lowThreshold, lowThreshold)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).cacheTimeout, cacheTimeout)
 
 	suite.assert.Equal(suite.fileCache.createEmptyFile, createEmptyFile)
 	suite.assert.Equal(suite.fileCache.allowNonEmpty, allowNonEmptyTemp)
@@ -224,7 +248,7 @@ func (suite *fileCacheTestSuite) TestConfigPolicyTimeout() {
 func (suite *fileCacheTestSuite) TestConfigPolicyDefaultTimeout() {
 	defer suite.cleanupTest()
 	suite.cleanupTest() // teardown the default file cache generated
-	policy := "lfu"
+	policy := "lru"
 	maxSizeMb := 1024
 	cacheTimeout := defaultFileCacheTimeout
 	maxDeletion := 10
@@ -241,11 +265,11 @@ func (suite *fileCacheTestSuite) TestConfigPolicyDefaultTimeout() {
 	suite.assert.Equal(suite.fileCache.tmpPath, suite.cache_path)
 	suite.assert.Equal(suite.fileCache.policy.Name(), policy)
 
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).maxSizeMB, maxSizeMb)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).maxEviction, maxDeletion)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).highThreshold, highThreshold)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).lowThreshold, lowThreshold)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).cacheTimeout, cacheTimeout)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).maxSizeMB, maxSizeMb)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).maxEviction, maxDeletion)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).highThreshold, highThreshold)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).lowThreshold, lowThreshold)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).cacheTimeout, cacheTimeout)
 
 	suite.assert.Equal(suite.fileCache.createEmptyFile, createEmptyFile)
 	suite.assert.Equal(suite.fileCache.allowNonEmpty, allowNonEmptyTemp)
@@ -256,7 +280,7 @@ func (suite *fileCacheTestSuite) TestConfigPolicyDefaultTimeout() {
 func (suite *fileCacheTestSuite) TestConfigZero() {
 	defer suite.cleanupTest()
 	suite.cleanupTest() // teardown the default file cache generated
-	policy := "lfu"
+	policy := "lru"
 	maxSizeMb := 1024
 	cacheTimeout := 0
 	maxDeletion := 10
@@ -273,10 +297,10 @@ func (suite *fileCacheTestSuite) TestConfigZero() {
 	suite.assert.Equal(suite.fileCache.tmpPath, suite.cache_path)
 	suite.assert.Equal(suite.fileCache.policy.Name(), policy)
 
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).maxSizeMB, maxSizeMb)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).maxEviction, maxDeletion)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).highThreshold, highThreshold)
-	suite.assert.EqualValues(suite.fileCache.policy.(*lfuPolicy).lowThreshold, lowThreshold)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).maxSizeMB, maxSizeMb)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).maxEviction, maxDeletion)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).highThreshold, highThreshold)
+	suite.assert.EqualValues(suite.fileCache.policy.(*lruPolicy).lowThreshold, lowThreshold)
 
 	suite.assert.Equal(suite.fileCache.createEmptyFile, createEmptyFile)
 	suite.assert.Equal(suite.fileCache.allowNonEmpty, allowNonEmptyTemp)
