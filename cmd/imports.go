@@ -38,7 +38,6 @@ import (
 	_ "github.com/Azure/azure-storage-fuse/v2/component/azstorage"
 	_ "github.com/Azure/azure-storage-fuse/v2/component/block_cache"
 	_ "github.com/Azure/azure-storage-fuse/v2/component/encryptor"
-	_ "github.com/Azure/azure-storage-fuse/v2/component/encryptor_v2"
 	_ "github.com/Azure/azure-storage-fuse/v2/component/file_cache"
 	_ "github.com/Azure/azure-storage-fuse/v2/component/libfuse"
 	_ "github.com/Azure/azure-storage-fuse/v2/component/loopback"
