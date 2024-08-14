@@ -22,9 +22,8 @@ func EncryptChunk(data []byte, key []byte) (cipherText []byte, nonce []byte, err
 		return nil, nil, err
 	}
 
-	// Generate a random nonce
-	nonce = make([]byte, gcm.NonceSize())
 	// Generate a random nonce for each chunk
+	nonce = make([]byte, gcm.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, nil, err
 	}

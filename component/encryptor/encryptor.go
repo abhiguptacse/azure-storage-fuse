@@ -40,10 +40,11 @@ type encryptorOptions struct {
 }
 
 const (
-	compName    = "encryptor"
-	AuthTagSize = 16
-	NonceSize   = 12
-	MetaSize    = 28 // Sum of AuthTagSize and NonceSize.
+	compName         = "encryptor"
+	AuthTagSize      = 16
+	NonceSize        = 12
+	MetaSize         = 28 // MetaSize = AuthTagSize + NonceSize.
+	EnvEncryptionKey = "ENCRYPTION_KEY"
 )
 
 var _ internal.Component = &Encryptor{}
@@ -74,16 +75,11 @@ func (e *Encryptor) Configure(isParent bool) error {
 		return fmt.Errorf("error reading config for %s: %w", e.Name(), err)
 	}
 
-	key := os.Getenv("ENCRYPTION_KEY")
-	if key == "" {
-		key = conf.EncryptionKey
-		if key == "" {
-			log.Err("Encryptor::Configure : encryption key not set")
-			return fmt.Errorf("encryption key not set")
-		}
+	if conf.EncryptionKey == "" {
+		log.Err("Encryptor::Configure : encryption key not set")
+		return fmt.Errorf("encryption key not set")
 	}
-
-	e.encryptionKey, err = base64.StdEncoding.DecodeString(key)
+	e.encryptionKey, err = base64.StdEncoding.DecodeString(conf.EncryptionKey)
 	if err != nil {
 		log.Err("Encryptor::Configure : error decoding encryption key")
 		return fmt.Errorf("error decoding encryption key: %w", err)
@@ -230,13 +226,13 @@ func (e *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.Obj
 
 	// Populate the ObjAttr struct with the file info.
 	attr = &internal.ObjAttr{
-		Mtime:  fileAttr.ModTime(),                // Modified time
-		Atime:  time.Now(),                        // Access time (current time as approximation)
-		Ctime:  fileAttr.ModTime(),                // Change time (same as modified time in this case)
-		Crtime: fileAttr.ModTime(),                // Creation time (not available in Go, using modified time)
-		Mode:   fileAttr.Mode(),                   // Permissions
-		Path:   e.mountPointCipher + options.Name, // Full path
-		Name:   fileAttr.Name(),                   // Base name of the path
+		Mtime:  fileAttr.ModTime(), // Modified time
+		Atime:  time.Now(),         // Access time (current time as approximation)
+		Ctime:  fileAttr.ModTime(), // Change time (same as modified time in this case)
+		Crtime: fileAttr.ModTime(), // Creation time (not available in Go, using modified time)
+		Mode:   fileAttr.Mode(),    // Permissions
+		Path:   options.Name,       // File path
+		Name:   fileAttr.Name(),    // Base name of the path
 	}
 	fileHandle, err := os.OpenFile(e.mountPointCipher+options.Name, os.O_RDONLY, 0666)
 	if err != nil {
@@ -266,7 +262,7 @@ func (e *Encryptor) StageData(opt internal.StageDataOptions) error {
 
 	paddingLength := int64(0)
 	dataLen := int64(len(opt.Data))
-	blockId := opt.Offset
+	blockOffset := opt.Offset
 	if dataLen < int64(e.blockSize) {
 		// Pad the data to the block size.
 		paddingLength = int64(e.blockSize) - dataLen
@@ -278,10 +274,10 @@ func (e *Encryptor) StageData(opt internal.StageDataOptions) error {
 		return err
 	}
 
-	encryptedChunkOffset := int64(blockId) * (int64(e.blockSize) + int64(MetaSize))
+	encryptedChunkOffset := int64(blockOffset) * (int64(e.blockSize) + int64(MetaSize))
+	log.Debug("Encryptor::StageData : writing %d bytes to encrypted file: %s at offset %d", len(encryptedChunk)+NonceSize, opt.Name, encryptedChunkOffset)
 	// Write the combined nonce and encrypted chunk.
 	n, err := e.handle.WriteAt(append(nonce, encryptedChunk...), encryptedChunkOffset)
-	log.Debug("Encryptor::StageData : writing %d bytes to encrypted file: %s at offset %d", n, opt.Name, encryptedChunkOffset)
 	if err != nil {
 		log.Err("Encryptor: Error writing encrypted chunk to encrypted file: %s at offset %d : size of data %d", err.Error(), encryptedChunkOffset, n)
 		return err
@@ -289,8 +285,8 @@ func (e *Encryptor) StageData(opt internal.StageDataOptions) error {
 
 	e.lastChunkMeta.Lock()
 	defer e.lastChunkMeta.Unlock()
-	if int64(blockId) > e.lastChunkMeta.farthestBlockSeen {
-		e.lastChunkMeta.farthestBlockSeen = int64(blockId)
+	if int64(blockOffset) > e.lastChunkMeta.farthestBlockSeen {
+		e.lastChunkMeta.farthestBlockSeen = int64(blockOffset)
 	}
 
 	e.lastChunkMeta.paddingLength = paddingLength
@@ -365,4 +361,6 @@ func NewEncryptorComponent() internal.Component {
 
 func init() {
 	internal.AddComponent(compName, NewEncryptorComponent)
+	config.BindEnv("encryptor.encryption-key", EnvEncryptionKey)
+
 }
