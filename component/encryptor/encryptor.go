@@ -53,6 +53,8 @@ func (e *Encryptor) Name() string {
 	return compName
 }
 
+// ------------------------- Pipeline operations -------------------------------------------
+
 func (e *Encryptor) SetName(name string) {
 	e.BaseComponent.SetName(name)
 }
@@ -65,6 +67,9 @@ func (e *Encryptor) Priority() internal.ComponentPriority {
 	return internal.EComponentPriority.LevelMid()
 }
 
+// Configure : Pipeline will call this method after constructor so that you can read config and initialize yourself.
+//
+//	Return failure if any config is not valid to exit the process.
 func (e *Encryptor) Configure(isParent bool) error {
 	log.Trace("Encryptor::Configure :  %s", e.Name())
 
@@ -107,6 +112,9 @@ func (e *Encryptor) Configure(isParent bool) error {
 func (e *Encryptor) Start(ctx context.Context) error {
 	return nil
 }
+
+// ------------------------- File Operations -------------------------------------------
+
 func (e *Encryptor) CommitData(opt internal.CommitDataOptions) error {
 
 	defer e.handle.Close()
@@ -147,68 +155,6 @@ func (e *Encryptor) CreateFile(options internal.CreateFileOptions) (*handlemap.H
 
 	e.handle = fileHandle
 	return handle, nil
-}
-
-func formatListDirName(path string) string {
-	// If we check the root directory, make sure we pass "" instead of "/".
-	// If we aren't checking the root directory, then we want to extend the directory name so List returns all children and does not include the path itself.
-	if path == "/" {
-		path = ""
-	} else if path != "" {
-		path = internal.ExtendDirName(path)
-	}
-	return path
-}
-
-func (e *Encryptor) StreamDir(options internal.StreamDirOptions) ([]*internal.ObjAttr, string, error) {
-	var objAttrs []*internal.ObjAttr
-	path := formatListDirName(options.Name)
-	log.Info("Encryptor::StreamDir : %s", path)
-	files, err := os.ReadDir(e.mountPointCipher + path)
-	if err != nil {
-		log.Trace("Encryptor::StreamDir : Error reading directory %s : %s", path, err.Error())
-		return nil, "", err
-	}
-
-	for _, file := range files {
-		attr, err := e.GetAttr(internal.GetAttrOptions{Name: path + file.Name()})
-		if err != nil {
-			if err != syscall.ENOENT {
-				log.Trace("Encryptor::StreamDir : Error getting file attributes: %s", err.Error())
-				return objAttrs, "", err
-			}
-			log.Trace("Encryptor::StreamDir : File not found: %s", file.Name())
-			continue
-		}
-
-		objAttrs = append(objAttrs, attr)
-	}
-
-	return objAttrs, "", nil
-}
-
-func checkForActualFileSize(fileHandle *os.File, currentFileSize int64, blockSize int64) (int64, error) {
-
-	log.Info("Encryptor::checkForActualFileSize : currentFileSize %d", currentFileSize)
-	totalBlocks := currentFileSize / (blockSize + MetaSize)
-	if currentFileSize < totalBlocks*(blockSize+MetaSize)+8 {
-		return 0, nil
-	}
-
-	// Read the last 8 bytes of file and check for padding length.
-	paddingLengthBytes := make([]byte, 8)
-
-	// TODO(abhinavgupta) : Find a way to block this read until the last write is done.
-	// While writing to a file if there is a list operation coming in, it will read the
-	// wrong padding length.
-	_, err := fileHandle.ReadAt(paddingLengthBytes, currentFileSize-8)
-	if err != nil {
-		log.Err("Encryptor: Error reading last 8 bytes of file: %s", err.Error())
-		return 0, err
-	}
-
-	actualFileSize := currentFileSize - int64(binary.BigEndian.Uint64(paddingLengthBytes)) - totalBlocks*MetaSize - 8
-	return actualFileSize, nil
 }
 
 func (e *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.ObjAttr, err error) {
@@ -343,6 +289,8 @@ func (e *Encryptor) ReadInBuffer(options internal.ReadInBufferOptions) (length i
 	return
 }
 
+// ------------------------- Directory Operations -------------------------------------------
+
 func (e *Encryptor) CreateDir(options internal.CreateDirOptions) error {
 	log.Info("Encryptor::CreateDir : %s", e.mountPointCipher+options.Name)
 	err := os.Mkdir(e.mountPointCipher+options.Name, 0777)
@@ -353,14 +301,44 @@ func (e *Encryptor) CreateDir(options internal.CreateDirOptions) error {
 	return nil
 }
 
+func (e *Encryptor) StreamDir(options internal.StreamDirOptions) ([]*internal.ObjAttr, string, error) {
+	var objAttrs []*internal.ObjAttr
+	path := formatListDirName(options.Name)
+	log.Info("Encryptor::StreamDir : %s", path)
+	files, err := os.ReadDir(e.mountPointCipher + path)
+	if err != nil {
+		log.Trace("Encryptor::StreamDir : Error reading directory %s : %s", path, err.Error())
+		return nil, "", err
+	}
+
+	for _, file := range files {
+		attr, err := e.GetAttr(internal.GetAttrOptions{Name: path + file.Name()})
+		if err != nil {
+			if err != syscall.ENOENT {
+				log.Trace("Encryptor::StreamDir : Error getting file attributes: %s", err.Error())
+				return objAttrs, "", err
+			}
+			log.Trace("Encryptor::StreamDir : File not found: %s", file.Name())
+			continue
+		}
+
+		objAttrs = append(objAttrs, attr)
+	}
+
+	return objAttrs, "", nil
+}
+
+// ------------------------- Factory methods to create objects -------------------------------------------
+
+// Constructor to create object of this component
 func NewEncryptorComponent() internal.Component {
 	comp := &Encryptor{}
 	comp.SetName(compName)
 	return comp
 }
 
+// On init register this component to pipeline and supply your constructor
 func init() {
 	internal.AddComponent(compName, NewEncryptorComponent)
 	config.BindEnv("encryptor.encryption-key", EnvEncryptionKey)
-
 }

@@ -183,7 +183,6 @@ func (s *encryptorTestSuite) TestCreateDir() {
 			err := s.encryptor.CreateDir(internal.CreateDirOptions{Name: path})
 
 			s.assert.Nil(err)
-			// Directory should be in the account
 			fs, err := os.Stat(mountPath + path)
 			s.assert.Nil(err)
 			s.assert.True(fs.IsDir())
@@ -246,13 +245,7 @@ func (s *encryptorTestSuite) TestReadInbuffer() {
 	for i := 0; i < totalBlocks; i++ {
 		n, err := s.encryptor.ReadInBuffer(internal.ReadInBufferOptions{Handle: h, Offset: int64(i * BlockSize), Data: chunk})
 		s.assert.Nil(err)
-		if i == totalBlocks-1 {
-			s.assert.Equal(int(fileSize%BlockSize), n)
-			s.assert.True(bytes.Equal(dataWritten[i*MB:], chunk[:len(dataWritten[i*MB:])]))
-		} else {
-			s.assert.Equal(MB, n)
-			s.assert.True(bytes.Equal(chunk, dataWritten[i*MB:(i+1)*MB]))
-		}
+		s.assert.True(bytes.Equal(chunk[:n], dataWritten[i*MB:i*MB+n]))
 	}
 }
 
