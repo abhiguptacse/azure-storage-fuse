@@ -20,11 +20,11 @@ import (
 // Implements two mount approach with only one file for data and metadata.
 type Encryptor struct {
 	internal.BaseComponent
-	handle           *os.File
+	handleMap        sync.Map
 	blockSize        uint64
 	mountPointCipher string
 	encryptionKey    []byte
-	lastChunkMeta    *LastChunkMeta
+	lastChunkMetaMap sync.Map
 }
 
 type LastChunkMeta struct {
@@ -100,11 +100,6 @@ func (e *Encryptor) Configure(isParent bool) error {
 		e.mountPointCipher = conf.EncryptedMountPath
 	}
 
-	e.lastChunkMeta = &LastChunkMeta{
-		farthestBlockSeen: -1,
-		paddingLength:     0,
-	}
-
 	log.Info("Encryptor::Configure : block size %d, encrypted mount path %s", e.blockSize, e.mountPointCipher)
 	return nil
 }
@@ -117,23 +112,30 @@ func (e *Encryptor) Start(ctx context.Context) error {
 
 func (e *Encryptor) CommitData(opt internal.CommitDataOptions) error {
 
-	defer e.handle.Close()
-	e.lastChunkMeta.Lock()
-	defer e.lastChunkMeta.Unlock()
+	fileHandle, lastChunkMeta, err := getFileHandleAndLastChunkMeta(&e.handleMap, &e.lastChunkMetaMap, opt.Name)
+	if err != nil {
+		return err
+	}
+	defer fileHandle.Close()
+	lastChunkMeta.Lock()
+	defer lastChunkMeta.Unlock()
 
-	if e.lastChunkMeta.farthestBlockSeen != -1 {
+	if lastChunkMeta.farthestBlockSeen != -1 {
 		paddingLengthByte := make([]byte, 8)
-		binary.BigEndian.PutUint64(paddingLengthByte, uint64(e.lastChunkMeta.paddingLength))
-		endoffset := (e.lastChunkMeta.farthestBlockSeen + 1) * (int64(e.blockSize) + MetaSize)
-		n, err := e.handle.WriteAt(paddingLengthByte, endoffset)
-		log.Info("Encryptor::CommitData : writing %d bytes, padding length %d at offset %d", n, e.lastChunkMeta.paddingLength, endoffset)
+		binary.BigEndian.PutUint64(paddingLengthByte, uint64(lastChunkMeta.paddingLength))
+		endoffset := (lastChunkMeta.farthestBlockSeen + 1) * (int64(e.blockSize) + MetaSize)
+		n, err := fileHandle.WriteAt(paddingLengthByte, endoffset)
+		log.Info("Encryptor::CommitData : writing %d bytes, padding length %d at offset %d", n, lastChunkMeta.paddingLength, endoffset)
 		if err != nil {
 			log.Err("Encryptor: Error writing padding length to file: %s", err.Error())
 			return err
 		}
-		e.lastChunkMeta.farthestBlockSeen = -1
-		e.lastChunkMeta.paddingLength = 0
+		lastChunkMeta.farthestBlockSeen = -1
+		lastChunkMeta.paddingLength = 0
 	}
+
+	e.handleMap.Delete(opt.Name)
+	e.lastChunkMetaMap.Delete(opt.Name)
 	return nil
 }
 
@@ -153,7 +155,11 @@ func (e *Encryptor) CreateFile(options internal.CreateFileOptions) (*handlemap.H
 		return nil, err
 	}
 
-	e.handle = fileHandle
+	e.handleMap.Store(options.Name, fileHandle)
+	e.lastChunkMetaMap.Store(options.Name, &LastChunkMeta{
+		farthestBlockSeen: -1,
+		paddingLength:     0,
+	})
 	return handle, nil
 }
 
@@ -206,6 +212,10 @@ func (e *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.Obj
 func (e *Encryptor) StageData(opt internal.StageDataOptions) error {
 	log.Info("Encryptor::StageData : %s, offset %d, data %d", opt.Name, opt.Offset, len(opt.Data))
 
+	fileHandle, lastChunkMeta, err := getFileHandleAndLastChunkMeta(&e.handleMap, &e.lastChunkMetaMap, opt.Name)
+	if err != nil {
+		return err
+	}
 	paddingLength := int64(0)
 	dataLen := int64(len(opt.Data))
 	blockOffset := opt.Offset
@@ -223,20 +233,20 @@ func (e *Encryptor) StageData(opt internal.StageDataOptions) error {
 	encryptedChunkOffset := int64(blockOffset) * (int64(e.blockSize) + int64(MetaSize))
 	log.Debug("Encryptor::StageData : writing %d bytes to encrypted file: %s at offset %d", len(encryptedChunk)+NonceSize, opt.Name, encryptedChunkOffset)
 	// Write the combined nonce and encrypted chunk.
-	n, err := e.handle.WriteAt(append(nonce, encryptedChunk...), encryptedChunkOffset)
+	n, err := fileHandle.WriteAt(append(nonce, encryptedChunk...), encryptedChunkOffset)
 	if err != nil {
 		log.Err("Encryptor: Error writing encrypted chunk to encrypted file: %s at offset %d : size of data %d", err.Error(), encryptedChunkOffset, n)
 		return err
 	}
 
-	e.lastChunkMeta.Lock()
-	defer e.lastChunkMeta.Unlock()
-	if int64(blockOffset) > e.lastChunkMeta.farthestBlockSeen {
-		e.lastChunkMeta.farthestBlockSeen = int64(blockOffset)
+	lastChunkMeta.Lock()
+	defer lastChunkMeta.Unlock()
+	if int64(blockOffset) > lastChunkMeta.farthestBlockSeen {
+		lastChunkMeta.farthestBlockSeen = int64(blockOffset)
 	}
 
-	e.lastChunkMeta.paddingLength = paddingLength
-	log.Debug("Encryptor:: encryptWriteBlock: endBlockIndex %d, paddingLength %d", e.lastChunkMeta.farthestBlockSeen, e.lastChunkMeta.paddingLength)
+	lastChunkMeta.paddingLength = paddingLength
+	log.Debug("Encryptor:: encryptWriteBlock: endBlockIndex %d, paddingLength %d", lastChunkMeta.farthestBlockSeen, lastChunkMeta.paddingLength)
 	return nil
 }
 

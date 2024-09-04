@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Azure/azure-storage-fuse/v2/common"
@@ -73,8 +74,6 @@ func randomString(length int) string {
 }
 
 func writeToFile(fileHandle *os.File, data []byte) error {
-	// writing 10MB + 512KB (data) + 512 KB(padded zeros) blocks of encrypted data to the file
-
 	encryptionKey, err := base64.StdEncoding.DecodeString(testConfig.EncryptionKey)
 	if err != nil {
 		fmt.Println("Error decoding encryption key", err)
@@ -121,11 +120,6 @@ func (s *encryptorTestSuite) SetupTest() {
 		Level:       common.ELogLevel.LOG_DEBUG(),
 	}
 	_ = log.SetDefaultLogger("base", cfg)
-	// homeDir, err := os.UserHomeDir()
-	// if err != nil {
-	// 	fmt.Println("Unable to get home directory")
-	// 	os.Exit(1)
-	// }
 
 	cfgFile, err := os.Open("./encryptortest.json")
 	if err != nil {
@@ -151,7 +145,8 @@ func (s *encryptorTestSuite) SetupTest() {
 		os.Exit(1)
 	}
 
-	configuration := "encryptor:\n block-size-mb: 1 \n encrypted-mount-path: unit/\n encryption-key: kOwvAznCYUMcrs0qdET0gCIQmMPsl7EDgcbSVWlum6U="
+	configuration := fmt.Sprintf("encryptor:\n block-size-mb: %d \n encrypted-mount-path: %s\n encryption-key: %s",
+		testConfig.BlockSize, testConfig.EncryptedMountPath, testConfig.EncryptionKey)
 	s.assert = assert.New(s.T())
 	s.encryptor, err = NewTestEncryptor(configuration)
 	if err != nil {
@@ -218,7 +213,9 @@ func (s *encryptorTestSuite) TestGetAttr() {
 	data := make([]byte, fileSize)
 	_, err = rand.Read(data)
 	s.assert.Nil(err)
-	err = writeToFile(s.encryptor.handle, data)
+	handle, ok := s.encryptor.handleMap.Load(name)
+	s.assert.True(ok)
+	err = writeToFile(handle.(*os.File), data)
 	s.assert.Nil(err)
 	attr, err := s.encryptor.GetAttr(internal.GetAttrOptions{Name: name})
 	s.assert.Nil(err)
@@ -238,13 +235,18 @@ func (s *encryptorTestSuite) TestReadInbuffer() {
 	dataWritten := make([]byte, fileSize)
 	_, err = rand.Read(dataWritten)
 	s.assert.Nil(err)
-	err = writeToFile(s.encryptor.handle, dataWritten)
+	handle, ok := s.encryptor.handleMap.Load(name)
+	s.assert.True(ok)
+	err = writeToFile(handle.(*os.File), dataWritten)
+	s.assert.Nil(err)
+
 	s.assert.Nil(err)
 
 	chunk := make([]byte, 1*MB)
 	for i := 0; i < totalBlocks; i++ {
 		n, err := s.encryptor.ReadInBuffer(internal.ReadInBufferOptions{Handle: h, Offset: int64(i * BlockSize), Data: chunk})
 		s.assert.Nil(err)
+
 		s.assert.True(bytes.Equal(chunk[:n], dataWritten[i*MB:i*MB+n]))
 	}
 }
@@ -294,6 +296,72 @@ func (s *encryptorTestSuite) TestStageData() {
 			s.assert.True(bytes.Equal(data[i*BlockSize:], decryptedData[:len(data[i*BlockSize:])]))
 		} else {
 			s.assert.True(bytes.Equal(data[i*BlockSize:(i+1)*BlockSize], decryptedData))
+		}
+	}
+}
+
+func (s *encryptorTestSuite) TestParallelWrites() {
+
+	var wg sync.WaitGroup
+	fileCount := 3
+	// create a list of file which will have names of the files created
+	var files []string
+	for count := 0; count < fileCount; count++ {
+		files = append(files, generateFileName())
+	}
+
+	fileSize := int64(9*MB + 512*KB)
+	data := make([]byte, fileSize)
+	_, err := rand.Read(data)
+	s.assert.Nil(err)
+	totalBlocks := int(fileSize/BlockSize + 1)
+	for _, name := range files {
+		wg.Add(1)
+		go func(name string) {
+			defer wg.Done()
+			h, err := s.encryptor.CreateFile(internal.CreateFileOptions{Name: name, Mode: 0666})
+			s.assert.Nil(err)
+			s.assert.NotNil(h)
+
+			for i := 0; i < totalBlocks; i++ {
+				var chunk []byte
+				if i == totalBlocks-1 {
+					chunk = data[i*BlockSize:]
+				} else {
+					chunk = data[i*BlockSize : (i+1)*BlockSize]
+				}
+				err = s.encryptor.StageData(internal.StageDataOptions{
+					Name:   name,
+					Offset: uint64(i),
+					Data:   chunk})
+				s.assert.Nil(err)
+			}
+		}(name)
+	}
+	wg.Wait()
+	fmt.Println("All files created and validated successfully.")
+
+	for _, name := range files {
+		_, err = os.Stat(mountPath + name)
+		s.assert.Nil(err)
+
+		fileHandle, err := os.OpenFile(mountPath+name, os.O_RDONLY, 0666)
+		s.assert.Nil(err)
+		defer fileHandle.Close()
+
+		for i := 0; i < totalBlocks; i++ {
+			encryptedChunk := make([]byte, BlockSize+MetaSize)
+			_, err = fileHandle.ReadAt(encryptedChunk, int64(i*(BlockSize+MetaSize)))
+			s.assert.Nil(err)
+			nonce := encryptedChunk[:NonceSize]
+			encryptedData := encryptedChunk[NonceSize:]
+			decryptedData, err := DecryptChunk(encryptedData, nonce, s.encryptor.encryptionKey)
+			s.assert.Nil(err)
+			if i == totalBlocks-1 {
+				s.assert.True(bytes.Equal(data[i*BlockSize:], decryptedData[:len(data[i*BlockSize:])]))
+			} else {
+				s.assert.True(bytes.Equal(data[i*BlockSize:(i+1)*BlockSize], decryptedData))
+			}
 		}
 	}
 }

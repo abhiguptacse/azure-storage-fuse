@@ -2,7 +2,9 @@ package encryptor
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
+	"sync"
 
 	"github.com/Azure/azure-storage-fuse/v2/common/log"
 	"github.com/Azure/azure-storage-fuse/v2/internal"
@@ -41,4 +43,28 @@ func checkForActualFileSize(fileHandle *os.File, currentFileSize int64, blockSiz
 
 	actualFileSize := currentFileSize - int64(binary.BigEndian.Uint64(paddingLengthBytes)) - totalBlocks*MetaSize - 8
 	return actualFileSize, nil
+}
+
+func getFileHandleAndLastChunkMeta(handleMap *sync.Map, lastChunkMetaMap *sync.Map, fileName string) (*os.File, *LastChunkMeta, error) {
+	fileValue, ok := handleMap.Load(fileName)
+	if !ok {
+		return nil, nil, fmt.Errorf("file handle not found for %s", fileName)
+	}
+
+	fileHandle, ok := fileValue.(*os.File)
+	if !ok {
+		return nil, nil, fmt.Errorf("unexpected type for file handle of %s", fileName)
+	}
+
+	metaValue, ok := lastChunkMetaMap.Load(fileName)
+	if !ok {
+		return nil, nil, fmt.Errorf("last chunk meta not found for %s", fileName)
+	}
+
+	lastChunkMeta, ok := metaValue.(*LastChunkMeta)
+	if !ok {
+		return nil, nil, fmt.Errorf("unexpected type for last chunk meta of %s", fileName)
+	}
+
+	return fileHandle, lastChunkMeta, nil
 }
