@@ -111,7 +111,7 @@ func (e *Encryptor) Start(ctx context.Context) error {
 // ------------------------- File Operations -------------------------------------------
 
 func (e *Encryptor) CommitData(opt internal.CommitDataOptions) error {
-
+	log.Trace("Encryptor::CommitData : %s", opt.Name)
 	fileHandle, lastChunkMeta, err := getFileHandleAndLastChunkMeta(&e.handleMap, &e.lastChunkMetaMap, opt.Name)
 	if err != nil {
 		return err
@@ -186,23 +186,49 @@ func (e *Encryptor) GetAttr(options internal.GetAttrOptions) (attr *internal.Obj
 		Path:   options.Name,       // File path
 		Name:   fileAttr.Name(),    // Base name of the path
 	}
-	fileHandle, err := os.OpenFile(e.mountPointCipher+options.Name, os.O_RDONLY, 0666)
-	if err != nil {
-		log.Trace("Encryptor::GetAttr : Error opening file: %s", err.Error())
-		return nil, err
-	}
-	defer fileHandle.Close()
 
 	if fileAttr.IsDir() {
 		attr.Size = fileAttr.Size()
 		attr.Flags.Set(internal.PropFlagIsDir)
 	} else {
-		actualFileSize, err := checkForActualFileSize(fileHandle, fileAttr.Size(), int64(e.blockSize))
-		if err != nil {
-			log.Err("Encryptor: Error checking for actual file size: %s", err.Error())
-			return nil, err
+		_, fileHandleExist := e.handleMap.Load(options.Name)
+		if !fileHandleExist {
+			fileHandle, err := os.OpenFile(e.mountPointCipher+options.Name, os.O_RDWR, 0666)
+			if err != nil {
+				log.Err("Encryptor::GetAttr : Error opening file: %s", err.Error())
+				return nil, err
+			}
+			// defer fileHandle.Close()
+
+			actualFileSize, paddingLength, err := checkForActualFileSize(fileHandle, fileAttr.Size(), int64(e.blockSize))
+			if err != nil {
+				log.Err("Encryptor: Error checking for actual file size: %s", err.Error())
+				return nil, err
+			}
+			e.handleMap.Store(options.Name, fileHandle)
+			e.lastChunkMetaMap.Store(options.Name, &LastChunkMeta{
+				farthestBlockSeen: actualFileSize / (int64(e.blockSize) - 1),
+				paddingLength:     paddingLength,
+			})
+
+			attr.Size = actualFileSize
+		} else {
+			metaValue, metaExist := e.lastChunkMetaMap.Load(options.Name)
+			if !metaExist {
+				return nil, fmt.Errorf("last chunk meta not found for %s", options.Name)
+			}
+
+			lastChunkMeta, ok := metaValue.(*LastChunkMeta)
+			if !ok {
+				return nil, fmt.Errorf("unexpected type for last chunk meta of %s", options.Name)
+			}
+
+			if lastChunkMeta.farthestBlockSeen == -1 {
+				attr.Size = 0
+			} else {
+				attr.Size = (lastChunkMeta.farthestBlockSeen+1)*int64(e.blockSize) - lastChunkMeta.paddingLength
+			}
 		}
-		attr.Size = actualFileSize
 	}
 	return attr, nil
 }
@@ -270,7 +296,7 @@ func (e *Encryptor) ReadInBuffer(options internal.ReadInBufferOptions) (length i
 	name := options.Handle.Path
 	log.Debug("Encryptor::ReadInBuffer : Read %s from %d offset for data size %d", name, options.Offset, len(options.Data))
 
-	fileHandle, err := os.OpenFile(e.mountPointCipher+name, os.O_RDONLY, 0666)
+	fileHandle, err := os.OpenFile(e.mountPointCipher+name, os.O_RDWR, 0666)
 	if err != nil {
 		log.Err("Encryptor::ReadAndDecryptBlock : Error opening encrypted file: %s", err.Error())
 		return 0, err

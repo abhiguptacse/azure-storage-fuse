@@ -213,9 +213,27 @@ func (s *encryptorTestSuite) TestGetAttr() {
 	data := make([]byte, fileSize)
 	_, err = rand.Read(data)
 	s.assert.Nil(err)
-	handle, ok := s.encryptor.handleMap.Load(name)
-	s.assert.True(ok)
-	err = writeToFile(handle.(*os.File), data)
+
+	_, err = rand.Read(data)
+	s.assert.Nil(err)
+	totalBlocks := int(fileSize/BlockSize + 1)
+
+	for i := 0; i < totalBlocks; i++ {
+		var chunk []byte
+		if i == totalBlocks-1 {
+			chunk = data[i*BlockSize:]
+		} else {
+			chunk = data[i*BlockSize : (i+1)*BlockSize]
+		}
+		err = s.encryptor.StageData(internal.StageDataOptions{
+			Name:   name,
+			Offset: uint64(i),
+			Data:   chunk})
+		s.assert.Nil(err)
+	}
+
+	_, err = os.Stat(mountPath + name)
+	s.assert.Nil(err)
 	s.assert.Nil(err)
 	attr, err := s.encryptor.GetAttr(internal.GetAttrOptions{Name: name})
 	s.assert.Nil(err)
